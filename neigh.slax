@@ -1,0 +1,459 @@
+/*
+ * Title               : neigh
+ * Last modified date  : 28.10.2018
+ * Author              : jumation.com
+ * Description         : By default, shows the IPv6 neighbor cache information
+ *                       in a simple format one line per IPv6 address which
+ *                       makes it easy to grep. In addition, interface
+ *                       descriptions are shown.
+ *                       When "resolve" is requested, then the script sends
+ *                       HTTP GET request to httpd in NMS in order to show the
+ *                       equivalent of RIR WHOIS database inet6num object
+ *                       netname attribute value from RDAP for each global
+ *                       unicast address and vendor name according to MAC
+ *                       address OUI. In case of link-local(fe80::/10) and
+ *                       unique local(fc00::/7) IPv6 addresses, the RDAP
+ *                       servers are not queried.
+ * Options             : "mac <MAC_ADDRESS>" - Specify a MAC address in
+ *                       00:11:22:33:44:55, 0011.2233.4455, 00-11-22-33-44-55
+ *                       or 001122334455 notation. For example, this is useful
+ *                       in case one would like to find a corresponding IPv6
+ *                       address to a MAC address when copying the MAC from
+ *                       Cisco IOS or Windows.
+ *                       "ip <IPv6_ADDRESS>" - Find a MAC address associated
+ *                       with IPv6 address.
+ *                       "interface <INT_NAME>" - Show information associated
+ *                       with specific interface.
+ *                       "resolve" - If set to "yes", then show the RIR db
+ *                       inet6num object netname attribute value for each
+ *                       global unicast IPv6 address and vendor name according
+ *                       to MAC address OUI.
+ * Notes               : Requires Junos 12.2 or newer.
+ */
+
+version 1.1;
+
+ns junos = "http://xml.juniper.net/junos/*/junos";
+ns xnm = "http://xml.juniper.net/xnm/1.1/xnm";
+ns jcs = "http://xml.juniper.net/junos/commit-scripts/1.0";
+ns curl extension = "http://xml.libslax.org/curl";
+ns jumation = "https://www.jumation.com/slaxfunctions";
+
+import "../import/junos.xsl";
+
+
+var $arguments = {
+	<argument> {
+		<name> "mac";
+		<description> "MAC address";
+	}
+	<argument> {
+		<name> "ip";
+		<description> "IPv6 address";
+	}
+	<argument> {
+		<name> "interface";
+		<description> "Name of the interface";
+	}
+	<argument> {
+		<name> "resolve";
+		<description> 'If set to "yes", then RIR db netname and vendor according to MAC are shown';
+	}
+}
+
+
+param $mac;
+param $ip;
+param $interface;
+param $resolve;
+
+
+/*
+ * Returns the netname for IPv6 address or vendor name associated with
+ * MAC address.
+ * It is important to check the IEEE registries before the U/L
+ * bit because there are some assignments made prior to adoption
+ * of IEEE 802 standards which have the U/L bit set. That's the reason
+ * why U/L bit is not checked in this script.
+ */
+function jumation:resolve($query_type, $value) {
+
+	/*
+	 * If state is incomplete/unreachable, then the
+	 * ipv6-nd-neighbor-l2-address is "none".
+	 */
+	if ( $query_type == "mac_addr" && $value == "none" ) {
+		result "";
+	}
+	else {
+		var $url = "http://mgmt-svr:8080/?" _ $query_type _ "=" _ $value;
+		var $params := {
+			/*
+			 * User-Agent string is specified for optional server-side
+			 * logging purposes.
+			 */
+			<header name="User-Agent"> "slaxproc";
+		}
+		var $response = curl:single($url, $params);
+
+		var $resolved_value := {
+			<curl> {
+				copy-of $response;
+			}
+		}
+
+		result translate($resolved_value/curl/results/raw-data, "\n\r", "");
+	}
+}
+
+
+/*
+ * Convert user-provided MAC address to six groups of two hexadecimal digits
+ * separated by colons.
+ * Supported input formats are six groups of two hex digits separated by
+ * hyphens(for example 00-11-22-33-44-55) and three groups of four hexadecimal
+ * digits separated by periods(for example 0011.2233.4455). IEEE 802 and Cisco
+ * notation respectively. In addition, notation of 12 hex digits without
+ * separator character is also supported(for example 001122334455).
+ */
+function jumation:normalize-mac($mac) {
+
+	var $octets = "([0-9a-f]{2})" _
+				"([0-9a-f]{2})" _
+				"([0-9a-f]{2})" _
+				"([0-9a-f]{2})" _
+				"([0-9a-f]{2})" _
+				"([0-9a-f]{2})";
+
+	/* Translate possible upper-case letters to lower-case letters. */
+	var $mac_lower = translate($mac, "ABCDEF", "abcdef");
+
+	if ( jcs:regex("^([0-9a-f]{2}:){5}[0-9a-f]{2}$", $mac_lower) ) {
+		result $mac_lower;
+	}
+	else if ( jcs:regex("^([0-9a-f]{4}\\.){2}[0-9a-f]{4}$", $mac_lower) ) {
+		var $mac_translated = translate($mac_lower, ".", "");
+		var $addr = jcs:regex($octets, $mac_translated);
+		result $addr[2] _ ":" _ $addr[3] _ ":" _ $addr[4] _
+				":" _ $addr[5] _ ":" _ $addr[6] _ ":" _ $addr[7];
+	}
+	else if ( jcs:regex("^([0-9a-f]{2}-){5}[0-9a-f]{2}$", $mac_lower) ) {
+		result translate($mac_lower, "-", ":");
+	}
+	else if ( jcs:regex("^[0-9a-f]{12}$", $mac_lower) ) {
+		var $addr = jcs:regex($octets, $mac_lower);
+		result $addr[2] _ ":" _ $addr[3] _ ":" _ $addr[4] _
+				":" _ $addr[5] _ ":" _ $addr[6] _ ":" _ $addr[7];
+	}
+	else {
+		terminate "Invalid MAC address";
+	}
+
+}
+
+
+/*
+ * SLAX parse-ip() function seems to return IPv6 address according
+ * to RFC5952. Same as get-ipv6-nd-information RPC.
+ */
+function jumation:normalize-ip($ip) {
+
+	var $normalized_ip = jcs:parse-ip($ip);
+
+	/* Check that the protocol family of the address is inet6. */
+	if ( $normalized_ip[2] != "inet6" ) {
+		terminate "Not a valid IPv6 address";
+	}
+
+	result $normalized_ip[1];
+
+}
+
+
+template column($neighbors) {
+
+	/* Initialize column width variables. */
+	mvar $c1 = 0;
+	mvar $c2 = 0;
+	mvar $c3 = 0;
+	mvar $c4 = 0;
+	mvar $c5 = 0;
+	mvar $c6 = 0;
+	mvar $c7 = 0;
+	mvar $c8 = 0;
+	mvar $c9 = 0;
+
+	var $column_descr := {
+		<ipv6-nd-entry> {
+			<ipv6-nd-neighbor-address> "IPv6 Address";
+			if ( $resolve ) {
+				<netname> "Netname";
+			}
+			else {
+				<netname> "";
+			}
+			<ipv6-nd-neighbor-l2-address> "Linklayer Address";
+			if ( $resolve ) {
+				<vendor> "Vendor";
+			}
+			else {
+				<vendor> "";
+			}
+			<ipv6-nd-state> "State";
+			<ipv6-nd-expire> "Exp";
+			<ipv6-nd-isrouter> "Rtr";
+			<ipv6-nd-issecure> "Secure";
+			<ipv6-nd-interface-name> "Interface";
+			<ipv6-nd-interface-descr> "Interface Description";
+		}
+	}
+
+	/*
+	 * Find the width of the widest cell for each column.
+	 * Union operator is used to combine $column_descr and
+	 * $neighbors node-sets.
+	 */
+	for-each (($column_descr | $neighbors)//ipv6-nd-entry) {
+
+		if ( string-length(ipv6-nd-neighbor-address) > $c1 ) {
+			set $c1 = string-length(ipv6-nd-neighbor-address);
+		}
+
+		if ( string-length(netname) > $c2 ) {
+			set $c2 = string-length(netname);
+		}
+
+		if ( string-length(ipv6-nd-neighbor-l2-address) > $c3 ) {
+			set $c3 = string-length(ipv6-nd-neighbor-l2-address);
+		}
+
+		if ( string-length(vendor) > $c4 ) {
+			set $c4 = string-length(vendor);
+		}
+
+		if ( string-length(ipv6-nd-state) > $c5 ) {
+			set $c5 = string-length(ipv6-nd-state);
+		}
+
+		if ( string-length(ipv6-nd-expire) > $c6 ) {
+			set $c6 = string-length(ipv6-nd-expire);
+		}
+
+		if ( string-length(ipv6-nd-isrouter) > $c7 ) {
+			set $c7 = string-length(ipv6-nd-isrouter);
+		}
+
+		if ( string-length(ipv6-nd-issecure) > $c8 ) {
+			set $c8 = string-length(ipv6-nd-issecure);
+		}
+
+		if ( string-length(ipv6-nd-interface-name) > $c9 ) {
+			set $c9 = string-length(ipv6-nd-interface-name);
+		}
+
+	}
+
+	var $format_string = "%-" _ $c1 _ "s  %-" _ $c2 _ "s  %-" _ $c3 _
+						 "s  %" _ $c4 _ "s  %-" _ $c5 _ "s  %-" _
+						 $c6 _ "s  %" _ $c7 _ "s  %" _ $c8 _
+						 "s  %" _ $c9 _ "s  %s\n";
+
+
+
+	for-each (($column_descr | $neighbors)//ipv6-nd-entry) {
+
+		<output> jcs:printf($format_string,
+							ipv6-nd-neighbor-address,
+							netname,
+							ipv6-nd-neighbor-l2-address,
+							vendor,
+							ipv6-nd-state,
+							ipv6-nd-expire,
+							ipv6-nd-isrouter,
+							ipv6-nd-issecure,
+							ipv6-nd-interface-name,
+							ipv6-nd-interface-descr);
+
+	}
+}
+
+
+match / {
+	<op-script-results> {
+
+		/* If "resolve" is specified, then it has to be "yes". */
+		if ( $resolve && $resolve != "yes" ) {
+			terminate 'Only valid argument for "resolve" is "yes"';
+		}
+
+
+		var $ipv6_nd_info = jcs:invoke('get-ipv6-nd-information');
+
+		if ( $ipv6_nd_info/../xnm:error ) {
+			copy-of $ipv6_nd_info;
+			terminate;
+		}
+
+
+		var $int_info_rpc = {
+			<get-interface-information> {
+				<descriptions>;
+			}
+		}
+		var $int_descr = jcs:invoke($int_info_rpc);
+
+		if ( $int_descr/../xnm:error ) {
+			copy-of $int_descr;
+			terminate;
+		}
+
+
+		/*
+		 * Mutable variable $resolved_addr is declared in order to hold
+		 * already resolved addresses and thus make as few requests
+		 * to external server as possible for performance reasons.
+		 */
+		mvar $resolved_addr;
+		set $resolved_addr = <resolved> {
+			<addr>;
+			<name>;
+		}
+
+
+		var $ipv6_nd_info_trimmed := {
+			for-each ($ipv6_nd_info/ipv6-nd-entry) {
+				<ipv6-nd-entry> {
+					for-each (*) {
+						if ( name() == "ipv6-nd-neighbor-address" ) {
+							<ipv6-nd-neighbor-address> translate(.,"\n\r", "");
+						}
+						else {
+							copy-of .;
+						}
+					}
+				}
+			}
+		}
+
+
+		var $selected_ipv6_nd_info := {
+			if ( not($mac) && not($ip) && not($interface) ) {
+				 copy-of $ipv6_nd_info_trimmed/ipv6-nd-entry;
+			}
+			else if ( $mac && not($ip) && not($interface) ) {
+				var $mac = jumation:normalize-mac($mac);
+				copy-of $ipv6_nd_info_trimmed/ipv6-nd-entry
+						[ipv6-nd-neighbor-l2-address == $mac];
+			}
+			else if ( $ip && not($mac) && not($interface) ) {
+				var $ip = jumation:normalize-ip($ip);
+				copy-of $ipv6_nd_info_trimmed/ipv6-nd-entry
+						[ipv6-nd-neighbor-address == $ip];
+			}
+			else if ( $interface && not($mac) && not($ip) ) {
+				copy-of $ipv6_nd_info_trimmed/ipv6-nd-entry
+						[ipv6-nd-interface-name == $interface];
+			}
+			else if ( $mac && $ip && not($interface) ) {
+				var $mac = jumation:normalize-mac($mac);
+				var $ip = jumation:normalize-ip($ip);
+				copy-of $ipv6_nd_info_trimmed/ipv6-nd-entry
+						[ipv6-nd-neighbor-l2-address == $mac &&
+						ipv6-nd-neighbor-address == $ip];
+			}
+			else if ( $mac && $interface && not($ip) ) {
+				var $mac = jumation:normalize-mac($mac);
+				copy-of $ipv6_nd_info_trimmed/ipv6-nd-entry
+						[ipv6-nd-neighbor-l2-address == $mac &&
+						ipv6-nd-interface-name == $interface];
+			}
+			else if ( $ip && $interface && not($mac) ) {
+				var $ip = jumation:normalize-ip($ip);
+				copy-of $ipv6_nd_info_trimmed/ipv6-nd-entry
+						[ipv6-nd-neighbor-address == $ip &&
+						ipv6-nd-interface-name == $interface];
+			}
+			else if ( $mac && $ip && $interface ) {
+				var $mac = jumation:normalize-mac($mac);
+				var $ip = jumation:normalize-ip($ip);
+				copy-of $ipv6_nd_info_trimmed/ipv6-nd-entry
+						[ipv6-nd-neighbor-l2-address == $mac &&
+						ipv6-nd-neighbor-address == $ip &&
+						ipv6-nd-interface-name == $interface];
+			}
+		}
+
+
+		var $neighbors := {
+
+			for-each ($selected_ipv6_nd_info/*) {
+				<ipv6-nd-entry> {
+					<ipv6-nd-neighbor-address> ipv6-nd-neighbor-address;
+					if ( $resolve ) {
+						var $ip = ipv6-nd-neighbor-address;
+
+						/* Check if IP has already been resolved. */
+						if ( $resolved_addr/resolved[addr == $ip] ) {
+							<netname> {
+								expr $resolved_addr/
+										resolved[addr == $ip]/name;
+							}
+						}
+						else {
+							var $netname = jumation:resolve("ip_addr", $ip);
+							<netname> {
+								expr $netname;
+							}
+
+							append $resolved_addr += <resolved> {
+								<addr> $ip;
+								<name> $netname;
+							}
+						}
+					}
+					else {
+						<netname>;
+					}
+					<ipv6-nd-neighbor-l2-address> ipv6-nd-neighbor-l2-address;
+					if ( $resolve ) {
+						var $mac_addr = ipv6-nd-neighbor-l2-address;
+
+						/* Check if MAC has already been resolved. */
+						if ( $resolved_addr/resolved[addr == $mac_addr] ) {
+							<vendor> {
+								expr $resolved_addr/
+										resolved[addr == $mac_addr]/name;
+							}
+						}
+						else {
+							var $vendor = jumation:resolve("mac_addr",
+															$mac_addr);
+							<vendor> {
+								expr $vendor;
+							}
+
+							append $resolved_addr += <resolved> {
+								<addr> $mac_addr;
+								<name> $vendor;
+							}
+						}
+					}
+					else {
+						<vendor>;
+					}
+					<ipv6-nd-state> ipv6-nd-state;
+					<ipv6-nd-expire> ipv6-nd-expire;
+					<ipv6-nd-isrouter> ipv6-nd-isrouter;
+					<ipv6-nd-issecure> ipv6-nd-issecure;
+					<ipv6-nd-interface-name> ipv6-nd-interface-name;
+					var $ipv6-nd-interface-name = ipv6-nd-interface-name;
+					<ipv6-nd-interface-descr> $int_descr/logical-interface
+								[name == $ipv6-nd-interface-name]/description;
+				}
+			}
+		}
+
+		call column($neighbors);
+
+	}
+}

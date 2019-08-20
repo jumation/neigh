@@ -1,0 +1,15 @@
+[Unit]
+Description=Finds manufacturer based on MAC and netname based on IP addr
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/var/www/
+ExecStart=/var/www/resolver.py
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
